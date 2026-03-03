@@ -5,6 +5,7 @@ import os
 
 import httpx
 from aiohttp import web
+from pyngrok import ngrok
 
 from client.api import PROVIDER_CONFIG
 
@@ -131,12 +132,12 @@ class ProxyServer:
 
     @staticmethod
     def _create_tunnel(port: int) -> str:
-        from pyngrok import ngrok
-
         auth_token = os.environ.get("NGROK_AUTHTOKEN", "")
         if auth_token:
             ngrok.set_auth_token(auth_token)
         tunnel = ngrok.connect(str(port), "http")
+        if tunnel.public_url is None:
+            raise RuntimeError("ngrok tunnel did not return a public URL")
         return tunnel.public_url
 
     async def stop(self) -> None:

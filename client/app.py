@@ -34,7 +34,8 @@ class ProviderScreen(Screen):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "provider-select" and event.value != Select.BLANK:
-            models = PROVIDERS.get(event.value, [])
+            provider = str(event.value)
+            models = PROVIDERS.get(provider, [])
             model_select = self.query_one("#model-select", Select)
             model_select.set_options([(m, m) for m in models])
 
@@ -73,7 +74,8 @@ class ExchangeScreen(Screen):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "want-provider-select" and event.value != Select.BLANK:
-            models = PROVIDERS.get(event.value, [])
+            provider = str(event.value)
+            models = PROVIDERS.get(provider, [])
             model_select = self.query_one("#want-model-select", Select)
             model_select.set_options([(m, m) for m in models])
 
@@ -281,18 +283,24 @@ class TokenHubApp(App):
     def on_mount(self) -> None:
         self.push_screen(ProviderScreen(), callback=self.on_provider_selected)
 
-    def on_provider_selected(self, result: tuple[str, str]) -> None:
+    def on_provider_selected(self, result: tuple[str, str] | None) -> None:
+        if result is None:
+            return
         self._provider, self._model = result
         self.push_screen(
             ExchangeScreen(self._provider, self._model),
             callback=self.on_exchange_configured,
         )
 
-    def on_exchange_configured(self, result: tuple[int, str, str]) -> None:
+    def on_exchange_configured(self, result: tuple[int, str, str] | None) -> None:
+        if result is None:
+            return
         self._tokens, self._want_provider, self._want_model = result
         self.push_screen(KeyScreen(self._provider), callback=self.on_key_validated)
 
-    def on_key_validated(self, api_key: str) -> None:
+    def on_key_validated(self, api_key: str | None) -> None:
+        if api_key is None:
+            return
         config = ExchangeConfig(
             provider=self._provider,
             model=self._model,
