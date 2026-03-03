@@ -52,6 +52,32 @@ class ProxyServer:
         model = data.get("model", self._model)
         return model == self._model
 
+    def _cap_output_tokens(self, body: bytes) -> bytes:
+        remaining = self._budget - self._served
+        if remaining <= 0:
+            return body
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return body
+
+        if self._provider == "openai":
+            user_max = data.get("max_completion_tokens") or data.get("max_tokens")
+            cap = min(user_max, remaining) if user_max else remaining
+            data.pop("max_tokens", None)
+            data["max_completion_tokens"] = cap
+        elif self._provider == "anthropic":
+            user_max = data.get("max_tokens")
+            data["max_tokens"] = min(user_max, remaining) if user_max else remaining
+        elif self._provider == "gemini":
+            gen_config = data.setdefault("generationConfig", {})
+            user_max = gen_config.get("maxOutputTokens")
+            gen_config["maxOutputTokens"] = (
+                min(user_max, remaining) if user_max else remaining
+            )
+
+        return json.dumps(data).encode()
+
     async def _forward_and_track(
         self, request: web.Request, url: str, extra_headers: dict | None = None
     ) -> web.Response:
@@ -66,6 +92,7 @@ class ProxyServer:
                 {"error": f"Only model '{self._model}' is available on this proxy"},
                 status=400,
             )
+        body = self._cap_output_tokens(body)
         config = PROVIDER_CONFIG[self._provider]
         headers = {
             "Content-Type": "application/json",
