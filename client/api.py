@@ -36,7 +36,11 @@ async def validate_key(provider: str, api_key: str) -> tuple[bool, str]:
                 resp = await client.post(
                     f"{config['base_url']}/v1/messages",
                     headers={**headers, "Content-Type": "application/json"},
-                    json={"model": "claude-sonnet-4", "max_tokens": 1, "messages": []},
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 1,
+                        "messages": [],
+                    },
                 )
                 if resp.status_code == 401:
                     return False, "Invalid API key"
