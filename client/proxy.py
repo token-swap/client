@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Awaitable, Callable
 
 import httpx
 from aiohttp import web
@@ -19,14 +20,21 @@ class ProxyServer:
         api_key: str,
         temp_key: str,
         token_budget: int,
-        on_tokens_served,
+        input_budget: int = 0,
+        output_budget: int = 0,
+        on_tokens_served: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
         self._api_key = api_key
         self._temp_key = temp_key
-        self._budget = token_budget
-        self._served = 0
+        self._input_budget = input_budget
+        self._output_budget = output_budget
+        self._total_budget = token_budget
+        self._input_served = 0
+        self._output_served = 0
+        self._total_served = 0
+        self._advanced = input_budget > 0 or output_budget > 0
         self._on_tokens_served = on_tokens_served
         self._runner: web.AppRunner | None = None
         self._tunnel_url: str | None = None
@@ -42,7 +50,12 @@ class ProxyServer:
         return False
 
     def _budget_exceeded(self) -> bool:
-        return self._served >= self._budget
+        if self._advanced:
+            return (
+                self._input_served >= self._input_budget
+                and self._output_served >= self._output_budget
+            )
+        return self._total_served >= self._total_budget
 
     def _verify_model(self, body: bytes) -> bool:
         try:
@@ -53,9 +66,12 @@ class ProxyServer:
         return model == self._model
 
     def _cap_output_tokens(self, body: bytes) -> bytes:
-        remaining = self._budget - self._served
-        if remaining <= 0:
-            return body
+        if self._advanced:
+            remaining = self._output_budget - self._output_served
+        else:
+            remaining = self._total_budget - self._total_served
+        if remaining < 0:
+            remaining = 0
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, ValueError):
@@ -79,7 +95,10 @@ class ProxyServer:
         return json.dumps(data).encode()
 
     async def _forward_and_track(
-        self, request: web.Request, url: str, extra_headers: dict | None = None
+        self,
+        request: web.Request,
+        url: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> web.Response:
         if not self._verify_auth(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
@@ -94,22 +113,33 @@ class ProxyServer:
             )
         body = self._cap_output_tokens(body)
         config = PROVIDER_CONFIG[self._provider]
-        headers = {
+        auth_header = str(config["auth_header"])
+        auth_prefix = str(config["auth_prefix"])
+        headers: dict[str, str] = {
             "Content-Type": "application/json",
-            config["auth_header"]: config["auth_prefix"] + self._api_key,
-            **config["extra_headers"],
-            **(extra_headers or {}),
+            auth_header: auth_prefix + self._api_key,
         }
+        provider_headers = config["extra_headers"]
+        if isinstance(provider_headers, dict):
+            for key, value in provider_headers.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    headers[key] = value
+        if extra_headers:
+            headers.update(extra_headers)
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(url, content=body, headers=headers)
 
         resp_data = resp.json()
-        tokens = self._extract_tokens(resp_data, self._provider)
-        if tokens > 0:
-            self._served += tokens
+        input_count, output_count = self._extract_tokens(resp_data, self._provider)
+        if input_count > 0 or output_count > 0:
+            if self._advanced:
+                self._input_served += input_count
+                self._output_served += output_count
+            else:
+                self._total_served += input_count + output_count
             if self._on_tokens_served:
-                await self._on_tokens_served(tokens)
+                await self._on_tokens_served(input_count, output_count)
 
         return web.Response(
             body=resp.content,
@@ -118,22 +148,49 @@ class ProxyServer:
         )
 
     @staticmethod
-    def _extract_tokens(data: dict, provider: str) -> int:
+    def _extract_tokens(data: dict[str, object], provider: str) -> tuple[int, int]:
+        def _to_int(value: object) -> int:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except ValueError:
+                    return 0
+            return 0
+
         try:
             if provider == "openai":
                 usage = data.get("usage", {})
-                return usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                if not isinstance(usage, dict):
+                    return (0, 0)
+                return (
+                    _to_int(usage.get("prompt_tokens", 0)),
+                    _to_int(usage.get("completion_tokens", 0)),
+                )
             elif provider == "anthropic":
                 usage = data.get("usage", {})
-                return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                if not isinstance(usage, dict):
+                    return (0, 0)
+                return (
+                    _to_int(usage.get("input_tokens", 0)),
+                    _to_int(usage.get("output_tokens", 0)),
+                )
             elif provider == "gemini":
                 usage = data.get("usageMetadata", {})
-                return usage.get("promptTokenCount", 0) + usage.get(
-                    "candidatesTokenCount", 0
+                if not isinstance(usage, dict):
+                    return (0, 0)
+                return (
+                    _to_int(usage.get("promptTokenCount", 0)),
+                    _to_int(usage.get("candidatesTokenCount", 0)),
                 )
         except (AttributeError, TypeError):
             pass
-        return 0
+        return (0, 0)
 
     async def _handle_openai(self, request: web.Request) -> web.Response:
         url = f"{PROVIDER_CONFIG['openai']['base_url']}/v1/chat/completions"

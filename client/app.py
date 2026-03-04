@@ -17,6 +17,7 @@ from textual.widgets import (
     Input,
     Select,
     Static,
+    Switch,
     TextArea,
 )
 from textual import work
@@ -25,7 +26,7 @@ from client.api import validate_key
 from client.models import PROVIDERS, ExchangeConfig, PairingInfo
 
 
-class ProviderScreen(Screen):
+class ProviderScreen(Screen[tuple[str, str]]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="main-container"):
@@ -54,10 +55,10 @@ class ProviderScreen(Screen):
         if provider == Select.BLANK or model == Select.BLANK:
             self.notify("Select both provider and model", severity="error")
             return
-        self.dismiss((provider, model))
+        self.dismiss((str(provider), str(model)))
 
 
-class ExchangeScreen(Screen):
+class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
     def __init__(self, provider: str, model: str) -> None:
         super().__init__()
         self.provider = provider
@@ -67,8 +68,23 @@ class ExchangeScreen(Screen):
         yield Header()
         with Container(id="main-container"):
             yield Static(f"Offering: {self.provider}/{self.model}", classes="title")
-            yield Static("Tokens to share")
+            yield Static("Tokens to share", id="tokens-label")
             yield Input(placeholder="e.g. 1000", id="tokens-input", type="integer")
+            with Horizontal(id="advanced-toggle-row"):
+                yield Static("Advanced", id="advanced-label")
+                yield Switch(id="advanced-switch")
+            yield Static("Input tokens to share", id="input-tokens-label")
+            yield Input(
+                placeholder="e.g. 700",
+                id="input-tokens-input",
+                type="integer",
+            )
+            yield Static("Output tokens to share", id="output-tokens-label")
+            yield Input(
+                placeholder="e.g. 300",
+                id="output-tokens-input",
+                type="integer",
+            )
             yield Static("Want provider")
             other_providers = [p for p in PROVIDERS if p != self.provider]
             yield Select(
@@ -81,6 +97,27 @@ class ExchangeScreen(Screen):
             yield Button("Next", id="next-btn", variant="primary")
         yield Footer()
 
+    def on_mount(self) -> None:
+        self._set_advanced_mode(False)
+
+    def _set_advanced_mode(self, advanced: bool) -> None:
+        self.query_one("#tokens-label", Static).display = not advanced
+        self.query_one("#tokens-input", Input).display = not advanced
+        self.query_one("#input-tokens-label", Static).display = advanced
+        self.query_one("#input-tokens-input", Input).display = advanced
+        self.query_one("#output-tokens-label", Static).display = advanced
+        self.query_one("#output-tokens-input", Input).display = advanced
+
+    @staticmethod
+    def _parse_positive_int(value: str) -> int | None:
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "want-provider-select" and event.value != Select.BLANK:
             provider = str(event.value)
@@ -88,22 +125,54 @@ class ExchangeScreen(Screen):
             model_select = self.query_one("#want-model-select", Select)
             model_select.set_options([(m, m) for m in models])
 
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        if event.switch.id == "advanced-switch":
+            self._set_advanced_mode(event.value)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         tokens_str = self.query_one("#tokens-input", Input).value
+        input_tokens_str = self.query_one("#input-tokens-input", Input).value
+        output_tokens_str = self.query_one("#output-tokens-input", Input).value
+        advanced = self.query_one("#advanced-switch", Switch).value
         want_provider = self.query_one("#want-provider-select", Select).value
         want_model = self.query_one("#want-model-select", Select).value
 
-        if not tokens_str or int(tokens_str) <= 0:
-            self.notify("Enter a positive number of tokens", severity="error")
-            return
         if want_provider == Select.BLANK or want_model == Select.BLANK:
             self.notify("Select wanted provider and model", severity="error")
             return
+        want_provider_str = str(want_provider)
+        want_model_str = str(want_model)
 
-        self.dismiss((int(tokens_str), want_provider, want_model))
+        if advanced:
+            input_tokens = self._parse_positive_int(input_tokens_str)
+            output_tokens = self._parse_positive_int(output_tokens_str)
+            if input_tokens is None or output_tokens is None:
+                self.notify(
+                    "Enter positive input and output token amounts",
+                    severity="error",
+                )
+                return
+            self.dismiss(
+                (
+                    0,
+                    want_provider_str,
+                    want_model_str,
+                    True,
+                    input_tokens,
+                    output_tokens,
+                )
+            )
+            return
+
+        tokens = self._parse_positive_int(tokens_str)
+        if tokens is None:
+            self.notify("Enter a positive number of tokens", severity="error")
+            return
+
+        self.dismiss((tokens, want_provider_str, want_model_str, False, 0, 0))
 
 
-class KeyScreen(Screen):
+class KeyScreen(Screen[str]):
     def __init__(self, provider: str) -> None:
         super().__init__()
         self.provider = provider
@@ -186,12 +255,16 @@ print(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
     return "# Unknown provider"
 
 
-class StatusScreen(Screen):
+class StatusScreen(Screen[None]):
     BINDINGS = [("q", "app.quit", "Quit")]
 
     status_text: reactive[str] = reactive("Connecting...")
     tokens_served: reactive[int] = reactive(0)
     tokens_used: reactive[int] = reactive(0)
+    input_tokens_served: reactive[int] = reactive(0)
+    output_tokens_served: reactive[int] = reactive(0)
+    input_tokens_used: reactive[int] = reactive(0)
+    output_tokens_used: reactive[int] = reactive(0)
     tokens_serve_limit: reactive[int] = reactive(0)
     tokens_use_limit: reactive[int] = reactive(0)
 
@@ -248,19 +321,47 @@ class StatusScreen(Screen):
         table.clear()
         peer_url = self._pairing.peer_url if self._pairing else "-"
         temp_key = self._pairing.temp_key if self._pairing else "-"
-        table.add_rows(
+        rows: list[tuple[str, str]] = [
+            ("Offering", f"{self.config.provider}/{self.config.model}"),
+            ("Tokens offered", str(self.config.tokens_offered)),
+            ("Wanting", f"{self.config.want_provider}/{self.config.want_model}"),
+        ]
+        if self._pairing and self._pairing.advanced:
+            rows.extend(
+                [
+                    (
+                        "Input Served / Limit",
+                        f"{self.input_tokens_served} / {self._pairing.input_tokens_to_serve or '-'}",
+                    ),
+                    (
+                        "Output Served / Limit",
+                        f"{self.output_tokens_served} / {self._pairing.output_tokens_to_serve or '-'}",
+                    ),
+                    (
+                        "Input Used / Limit",
+                        f"{self.input_tokens_used} / {self._pairing.input_tokens_granted or '-'}",
+                    ),
+                    (
+                        "Output Used / Limit",
+                        f"{self.output_tokens_used} / {self._pairing.output_tokens_granted or '-'}",
+                    ),
+                ]
+            )
+        else:
+            rows.extend(
+                [
+                    (
+                        "Served / Limit",
+                        f"{self.tokens_served} / {self.tokens_serve_limit or '-'}",
+                    ),
+                    (
+                        "Used / Limit",
+                        f"{self.tokens_used} / {self.tokens_use_limit or '-'}",
+                    ),
+                ]
+            )
+        rows.extend(
             [
-                ("Offering", f"{self.config.provider}/{self.config.model}"),
-                ("Tokens offered", str(self.config.tokens_offered)),
-                ("Wanting", f"{self.config.want_provider}/{self.config.want_model}"),
-                (
-                    "Served / Limit",
-                    f"{self.tokens_served} / {self.tokens_serve_limit or '-'}",
-                ),
-                (
-                    "Used / Limit",
-                    f"{self.tokens_used} / {self.tokens_use_limit or '-'}",
-                ),
                 (
                     "Peer",
                     f"{self._pairing.peer_provider}/{self._pairing.peer_model}"
@@ -271,6 +372,7 @@ class StatusScreen(Screen):
                 ("Temp Key", temp_key),
             ]
         )
+        table.add_rows(rows)
         if self._pairing:
             self.query_one("#copy-buttons", Horizontal).display = True
             self.query_one("#right-pane", Vertical).display = True
@@ -295,15 +397,31 @@ class StatusScreen(Screen):
     def watch_tokens_used(self) -> None:
         self._update_table()
 
-    async def on_proxy_tokens_served(self, count: int) -> None:
-        self.tokens_served += count
+    def watch_input_tokens_served(self) -> None:
+        self._update_table()
+
+    def watch_output_tokens_served(self) -> None:
+        self._update_table()
+
+    def watch_input_tokens_used(self) -> None:
+        self._update_table()
+
+    def watch_output_tokens_used(self) -> None:
+        self._update_table()
+
+    async def on_proxy_tokens_served(self, input_count: int, output_count: int) -> None:
+        self.tokens_served += input_count + output_count
+        self.input_tokens_served += input_count
+        self.output_tokens_served += output_count
         if self._pairing and self._ws:
             try:
                 await self._ws.send_json(
                     {
                         "type": "usage_report",
                         "offer_id": self._pairing.offer_id,
-                        "tokens": count,
+                        "tokens": input_count + output_count,
+                        "input_tokens": input_count,
+                        "output_tokens": output_count,
                     }
                 )
             except Exception:
@@ -340,6 +458,8 @@ class StatusScreen(Screen):
             api_key=self.config.api_key,
             temp_key="",
             token_budget=0,
+            input_budget=0,
+            output_budget=0,
             on_tokens_served=self.on_proxy_tokens_served,
         )
 
@@ -363,11 +483,30 @@ class StatusScreen(Screen):
 
                             elif data["type"] == "paired":
                                 self._pairing = PairingInfo.from_message(data)
-                                self.tokens_serve_limit = self._pairing.tokens_to_serve
-                                self.tokens_use_limit = self._pairing.tokens_granted
+                                self.tokens_serve_limit = (
+                                    self._pairing.tokens_to_serve
+                                    or (
+                                        self._pairing.input_tokens_to_serve
+                                        + self._pairing.output_tokens_to_serve
+                                    )
+                                )
+                                self.tokens_use_limit = (
+                                    self._pairing.tokens_granted
+                                    or (
+                                        self._pairing.input_tokens_granted
+                                        + self._pairing.output_tokens_granted
+                                    )
+                                )
 
                                 proxy._temp_key = self._pairing.proxy_key
-                                proxy._budget = self._pairing.tokens_to_serve
+                                proxy._total_budget = self.tokens_serve_limit
+                                proxy._input_budget = (
+                                    self._pairing.input_tokens_to_serve
+                                )
+                                proxy._output_budget = (
+                                    self._pairing.output_tokens_to_serve
+                                )
+                                proxy._advanced = self._pairing.advanced
 
                                 self.status_text = (
                                     f"[green]Paired! Proxy: {tunnel_url}[/]"
@@ -378,7 +517,14 @@ class StatusScreen(Screen):
                                 self.status_text = f"[red]Error: {data['message']}[/]"
 
                             elif data["type"] == "usage_update":
-                                self.tokens_used += data.get("tokens", 0)
+                                input_tokens = data.get("input_tokens", 0)
+                                output_tokens = data.get("output_tokens", 0)
+                                tokens = data.get(
+                                    "tokens", input_tokens + output_tokens
+                                )
+                                self.tokens_used += tokens
+                                self.input_tokens_used += input_tokens
+                                self.output_tokens_used += output_tokens
 
                         elif msg.type in (
                             aiohttp.WSMsgType.CLOSE,
@@ -395,7 +541,7 @@ class StatusScreen(Screen):
             await proxy.stop()
 
 
-class TokenHubApp(App):
+class TokenHubApp(App[None]):
     CSS_PATH = "app.tcss"
     TITLE = "TokenHub"
     BINDINGS = [("q", "quit", "Quit")]
@@ -404,6 +550,12 @@ class TokenHubApp(App):
         super().__init__()
         self._provider: str = ""
         self._model: str = ""
+        self._tokens: int = 0
+        self._want_provider: str = ""
+        self._want_model: str = ""
+        self._advanced: bool = False
+        self._input_tokens: int = 0
+        self._output_tokens: int = 0
 
     def on_mount(self) -> None:
         self.push_screen(ProviderScreen(), callback=self.on_provider_selected)
@@ -417,10 +569,19 @@ class TokenHubApp(App):
             callback=self.on_exchange_configured,
         )
 
-    def on_exchange_configured(self, result: tuple[int, str, str] | None) -> None:
+    def on_exchange_configured(
+        self, result: tuple[int, str, str, bool, int, int] | None
+    ) -> None:
         if result is None:
             return
-        self._tokens, self._want_provider, self._want_model = result
+        (
+            self._tokens,
+            self._want_provider,
+            self._want_model,
+            self._advanced,
+            self._input_tokens,
+            self._output_tokens,
+        ) = result
         self.push_screen(KeyScreen(self._provider), callback=self.on_key_validated)
 
     def on_key_validated(self, api_key: str | None) -> None:
@@ -429,10 +590,17 @@ class TokenHubApp(App):
         config = ExchangeConfig(
             provider=self._provider,
             model=self._model,
-            tokens_offered=self._tokens,
+            tokens_offered=(
+                self._input_tokens + self._output_tokens
+                if self._advanced
+                else self._tokens
+            ),
             want_provider=self._want_provider,
             want_model=self._want_model,
             api_key=api_key,
+            input_tokens_offered=self._input_tokens if self._advanced else 0,
+            output_tokens_offered=self._output_tokens if self._advanced else 0,
+            advanced=self._advanced,
         )
         self.push_screen(StatusScreen(config))
 

@@ -23,6 +23,21 @@ Input {
     margin: 1 0;
 }
 
+#advanced-toggle-row {
+    width: 100%;
+    height: auto;
+    align: left middle;
+    margin: 1 0;
+}
+
+#advanced-label {
+    width: 1fr;
+}
+
+#advanced-switch {
+    margin-left: 1;
+}
+
 #main-container Button {
     width: 100%;
     margin: 1 0;
