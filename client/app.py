@@ -147,13 +147,8 @@ class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
                 type="integer",
             )
             yield Static("Want provider")
-            all_want_providers = {
-                **PROVIDERS,
-                "github-copilot": COPILOT_MODELS_FALLBACK,
-            }
-            other_providers = [p for p in all_want_providers if p != self.provider]
             yield Select(
-                [(p.capitalize(), p) for p in other_providers],
+                [(p.capitalize(), p) for p in PROVIDERS],
                 prompt="Choose provider",
                 id="want-provider-select",
             )
@@ -201,6 +196,10 @@ class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
                 "github-copilot": COPILOT_MODELS_FALLBACK,
             }
             models = all_want_providers.get(provider, [])
+            if provider == self.provider:
+              options = [(m, m) for m in models if m != self.model]
+            else:
+              options = [(m, m) for m in models]
             model_select.set_options([(m, m) for m in models])
             model_select.clear()
 
