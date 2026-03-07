@@ -47,6 +47,9 @@ class ProxyServer:
             return request.headers.get("x-api-key", "") == self._temp_key
         elif self._provider == "gemini":
             return request.headers.get("x-goog-api-key", "") == self._temp_key
+        elif self._provider == "github-copilot":
+            auth = request.headers.get("Authorization", "")
+            return auth.removeprefix("Bearer ") == self._temp_key
         return False
 
     def _budget_exceeded(self) -> bool:
@@ -91,6 +94,11 @@ class ProxyServer:
             gen_config["maxOutputTokens"] = (
                 min(user_max, remaining) if user_max else remaining
             )
+        elif self._provider == "github-copilot":
+            user_max = data.get("max_completion_tokens") or data.get("max_tokens")
+            cap = min(user_max, remaining) if user_max else remaining
+            data.pop("max_tokens", None)
+            data["max_completion_tokens"] = cap
 
         return json.dumps(data).encode()
 
@@ -164,7 +172,7 @@ class ProxyServer:
             return 0
 
         try:
-            if provider == "openai":
+            if provider == "openai" or provider == "github-copilot":
                 usage = data.get("usage", {})
                 if not isinstance(usage, dict):
                     return (0, 0)
@@ -213,6 +221,10 @@ class ProxyServer:
         )
         return await self._forward_and_track(request, url)
 
+    async def _handle_copilot(self, request: web.Request) -> web.Response:
+        url = f"{PROVIDER_CONFIG['github-copilot']['base_url']}/chat/completions"
+        return await self._forward_and_track(request, url)
+
     def _create_app(self) -> web.Application:
         app = web.Application()
         if self._provider == "openai":
@@ -223,6 +235,8 @@ class ProxyServer:
             app.router.add_post(
                 "/v1beta/models/{model}:generateContent", self._handle_gemini
             )
+        elif self._provider == "github-copilot":
+            app.router.add_post("/chat/completions", self._handle_copilot)
         return app
 
     async def start(

@@ -31,6 +31,21 @@ PROVIDERS = {
     ],
 }
 
+# Fallback model list for github-copilot when dynamic fetch fails
+# or when selecting github-copilot as the "want" provider
+COPILOT_MODELS_FALLBACK = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "o4-mini",
+    "o3-mini",
+    "claude-sonnet-4",
+    "claude-3.5-sonnet",
+    "gemini-2.0-flash-001",
+]
+
 
 @dataclass
 class ExchangeConfig:
@@ -40,6 +55,8 @@ class ExchangeConfig:
     want_provider: str
     want_model: str
     api_key: str
+    auth_method: str = "api_key"  # "api_key" or "copilot"
+    github_token: str = ""  # GitHub OAuth token (for copilot token refresh)
     input_tokens_offered: int = 0
     output_tokens_offered: int = 0
     advanced: bool = False

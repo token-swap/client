@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import webbrowser
 
 import aiohttp
 from textual.app import App, ComposeResult
@@ -22,11 +23,24 @@ from textual.widgets import (
 )
 from textual import work
 
-from client.api import validate_key
-from client.models import PROVIDERS, ExchangeConfig, PairingInfo
+from client.api import fetch_provider_models, validate_key
+from client.copilot_auth import (
+    exchange_for_copilot_token,
+    fetch_copilot_models,
+    fetch_public_copilot_models,
+    poll_for_access_token,
+    refresh_copilot_token,
+    request_device_code,
+)
+from client.models import (
+    COPILOT_MODELS_FALLBACK,
+    PROVIDERS,
+    ExchangeConfig,
+    PairingInfo,
+)
 
 
-class ProviderScreen(Screen[tuple[str, str]]):
+class ProviderScreen(Screen[tuple[str, str, str]]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="main-container"):
@@ -37,6 +51,12 @@ class ProviderScreen(Screen[tuple[str, str]]):
                 prompt="Choose provider",
                 id="provider-select",
             )
+            yield Static("API key (optional, for live model list)")
+            yield Input(
+                placeholder="Paste API key", password=True, id="provider-key-input"
+            )
+            yield Button("Fetch Latest Models", id="fetch-models-btn")
+            yield Static("", id="provider-model-status", classes="status-text")
             yield Static("Select Model")
             yield Select([], prompt="Choose model", id="model-select")
             yield Button("Next", id="next-btn", variant="primary")
@@ -48,14 +68,55 @@ class ProviderScreen(Screen[tuple[str, str]]):
             models = PROVIDERS.get(provider, [])
             model_select = self.query_one("#model-select", Select)
             model_select.set_options([(m, m) for m in models])
+            model_select.clear()
+            self.query_one("#provider-model-status", Static).update("")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "fetch-models-btn":
+            self.fetch_latest_models()
+            return
+
         provider = self.query_one("#provider-select", Select).value
         model = self.query_one("#model-select", Select).value
         if provider == Select.BLANK or model == Select.BLANK:
             self.notify("Select both provider and model", severity="error")
             return
-        self.dismiss((str(provider), str(model)))
+        provider_key = self.query_one("#provider-key-input", Input).value.strip()
+        self.dismiss((str(provider), str(model), provider_key))
+
+    @work(exclusive=True)
+    async def fetch_latest_models(self) -> None:
+        provider = self.query_one("#provider-select", Select).value
+        key = self.query_one("#provider-key-input", Input).value.strip()
+        status = self.query_one("#provider-model-status", Static)
+        model_select = self.query_one("#model-select", Select)
+        fetch_btn = self.query_one("#fetch-models-btn", Button)
+
+        if provider == Select.BLANK:
+            self.notify("Choose a provider first", severity="error")
+            return
+        if not key:
+            self.notify("Enter API key to fetch live models", severity="error")
+            return
+
+        provider_name = str(provider)
+        fetch_btn.disabled = True
+        status.update("Fetching latest models...")
+        try:
+            models, message = await fetch_provider_models(provider_name, key)
+        finally:
+            fetch_btn.disabled = False
+
+        if models:
+            model_select.set_options([(m, m) for m in models])
+            model_select.clear()
+            status.update(f"Loaded {len(models)} live models")
+            return
+
+        fallback = PROVIDERS.get(provider_name, [])
+        model_select.set_options([(m, m) for m in fallback])
+        model_select.clear()
+        status.update(f"{message}. Using bundled model list.")
 
 
 class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
@@ -120,13 +181,90 @@ class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "want-provider-select" and event.value != Select.BLANK:
             provider = str(event.value)
-            models = PROVIDERS.get(provider, [])
             model_select = self.query_one("#want-model-select", Select)
+
+            if provider == "github-copilot":
+                model_select.set_options(
+                    [("Loading Copilot models...", "__copilot_models_loading__")]
+                )
+                model_select.clear()
+                self._load_copilot_want_models()
+                return
+
+            all_want_providers = {
+                **PROVIDERS,
+                "github-copilot": COPILOT_MODELS_FALLBACK,
+            }
+            models = all_want_providers.get(provider, [])
             if provider == self.provider:
-                options = [(m, m) for m in models if m != self.model]
+              options = [(m, m) for m in models if m != self.model]
             else:
-                options = [(m, m) for m in models]
-            model_select.set_options(options)
+              options = [(m, m) for m in models]
+            model_select.set_options([(m, m) for m in models])
+            model_select.clear()
+
+    @work(exclusive=True)
+    async def _load_copilot_want_models(self) -> None:
+        provider_select = self.query_one("#want-provider-select", Select)
+        model_select = self.query_one("#want-model-select", Select)
+
+        try:
+            models = await self._fetch_live_copilot_models_for_want()
+        except Exception:
+            models = []
+
+        current_provider = provider_select.value
+        if (
+            current_provider == Select.BLANK
+            or str(current_provider) != "github-copilot"
+        ):
+            return
+
+        if models:
+            model_select.set_options([(m, m) for m in models])
+            model_select.clear()
+            self.notify(
+                f"Loaded {len(models)} Copilot models",
+                severity="information",
+            )
+            return
+
+        model_select.set_options([(m, m) for m in COPILOT_MODELS_FALLBACK])
+        model_select.clear()
+        self.notify(
+            "Using bundled fallback Copilot model list",
+            severity="warning",
+        )
+
+    async def _fetch_live_copilot_models_for_want(self) -> list[str]:
+        app = self.app
+        copilot_token = getattr(app, "_copilot_token", "")
+        github_token = getattr(app, "_github_token", "")
+
+        if copilot_token:
+            try:
+                models = await fetch_copilot_models(copilot_token)
+                if models:
+                    return models
+            except Exception as e:
+                self.log(f"Copilot model fetch with cached token failed: {e}")
+
+        if github_token:
+            try:
+                refreshed = await refresh_copilot_token(github_token)
+                setattr(app, "_copilot_token", refreshed.copilot_token)
+                setattr(app, "_github_token", refreshed.github_token)
+                models = await fetch_copilot_models(refreshed.copilot_token)
+                if models:
+                    return models
+            except Exception as e:
+                self.log(f"Copilot model fetch after refresh failed: {e}")
+
+        public_models = await fetch_public_copilot_models()
+        if public_models:
+            return public_models
+
+        return []
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if event.switch.id == "advanced-switch":
@@ -142,6 +280,9 @@ class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
 
         if want_provider == Select.BLANK or want_model == Select.BLANK:
             self.notify("Select wanted provider and model", severity="error")
+            return
+        if want_model == "__copilot_models_loading__":
+            self.notify("Copilot models are still loading", severity="error")
             return
         want_provider_str = str(want_provider)
         want_model_str = str(want_model)
@@ -176,15 +317,21 @@ class ExchangeScreen(Screen[tuple[int, str, str, bool, int, int]]):
 
 
 class KeyScreen(Screen[str]):
-    def __init__(self, provider: str) -> None:
+    def __init__(self, provider: str, initial_key: str = "") -> None:
         super().__init__()
         self.provider = provider
+        self.initial_key = initial_key
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="main-container"):
             yield Static(f"Enter {self.provider.capitalize()} API Key", classes="title")
-            yield Input(placeholder="API key", password=True, id="key-input")
+            yield Input(
+                placeholder="API key",
+                password=True,
+                id="key-input",
+                value=self.initial_key,
+            )
             yield Button("Validate & Connect", id="validate-btn", variant="primary")
             yield Static("", id="key-status", classes="status-text")
         yield Footer()
@@ -210,6 +357,155 @@ class KeyScreen(Screen[str]):
         else:
             status.update(f"[red]{message}[/]")
             btn.disabled = False
+
+
+class AuthChoiceScreen(Screen[str]):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="main-container"):
+            yield Static("TokenHub", classes="title")
+            yield Static("How would you like to authenticate?")
+            yield Button(
+                "GitHub Copilot",
+                id="auth-copilot-btn",
+                variant="success",
+            )
+            yield Button(
+                "Use your API Key",
+                id="auth-apikey-btn",
+                variant="primary",
+            )
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "auth-apikey-btn":
+            self.dismiss("api_key")
+        elif event.button.id == "auth-copilot-btn":
+            self.dismiss("copilot")
+
+
+class CopilotAuthScreen(Screen[tuple[str, str]]):
+    _verification_uri: str = "https://github.com/login/device"
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="main-container"):
+            yield Static("GitHub Copilot Authentication", classes="title")
+            yield Static("", id="copilot-instructions")
+            yield Static("", id="copilot-code", classes="copilot-device-code")
+            yield Button(
+                "Open GitHub in Browser",
+                id="open-browser-btn",
+                variant="primary",
+            )
+            yield Static("", id="copilot-status", classes="status-text")
+            yield Button("← Back", id="copilot-back-btn", variant="default")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#copilot-instructions", Static).update(
+            "Starting device authorization..."
+        )
+        self.query_one("#open-browser-btn", Button).display = False
+        self.start_device_flow()
+
+    @work(exclusive=True)
+    async def start_device_flow(self) -> None:
+        try:
+            device = await request_device_code()
+
+            instructions = self.query_one("#copilot-instructions", Static)
+            code_display = self.query_one("#copilot-code", Static)
+            browser_btn = self.query_one("#open-browser-btn", Button)
+            status = self.query_one("#copilot-status", Static)
+
+            instructions.update(
+                f"Go to [bold]{device.verification_uri}[/bold] and enter this code:"
+            )
+            code_display.update(f"[bold]{device.user_code}[/bold]")
+            browser_btn.display = True
+            self._verification_uri = device.verification_uri
+            status.update("Waiting for authorization...")
+
+            github_token = await poll_for_access_token(
+                device.device_code,
+                interval=device.interval,
+                expires_in=device.expires_in,
+            )
+
+            status.update("Exchanging for Copilot token...")
+            copilot = await exchange_for_copilot_token(github_token)
+
+            status.update("[green]Authenticated![/]")
+            await asyncio.sleep(0.5)
+            self.dismiss((copilot.copilot_token, copilot.github_token))
+
+        except TimeoutError:
+            self.query_one("#copilot-status", Static).update(
+                "[red]Device code expired. Please try again.[/]"
+            )
+        except PermissionError as e:
+            self.query_one("#copilot-status", Static).update(f"[red]{e}[/]")
+        except Exception as e:
+            self.query_one("#copilot-status", Static).update(
+                f"[red]Authentication failed: {e}[/]"
+            )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "open-browser-btn":
+            uri = getattr(self, "_verification_uri", "https://github.com/login/device")
+            webbrowser.open(uri)
+        elif event.button.id == "copilot-back-btn":
+            self.workers.cancel_all()
+            self.dismiss(None)
+
+
+class CopilotModelScreen(Screen[str]):
+    def __init__(self, copilot_token: str) -> None:
+        super().__init__()
+        self.copilot_token = copilot_token
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Container(id="main-container"):
+            yield Static("Select Model", classes="title")
+            yield Static("Fetching available models...", id="copilot-model-status")
+            yield Select([], prompt="Choose model", id="copilot-model-select")
+            yield Button("Next", id="next-btn", variant="primary")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#copilot-model-select", Select).display = False
+        self.query_one("#next-btn", Button).display = False
+        self.load_models()
+
+    @work(exclusive=True)
+    async def load_models(self) -> None:
+        status = self.query_one("#copilot-model-status", Static)
+        model_select = self.query_one("#copilot-model-select", Select)
+        next_btn = self.query_one("#next-btn", Button)
+
+        try:
+            models = await fetch_copilot_models(self.copilot_token)
+            if not models:
+                models = list(COPILOT_MODELS_FALLBACK)
+                status.update("Using default model list")
+            else:
+                status.update(f"Found {len(models)} models")
+        except Exception:
+            models = list(COPILOT_MODELS_FALLBACK)
+            status.update("Could not fetch models, using defaults")
+
+        model_select.set_options([(m, m) for m in models])
+        model_select.display = True
+        next_btn.display = True
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        model = self.query_one("#copilot-model-select", Select).value
+        if model == Select.BLANK:
+            self.notify("Select a model", severity="error")
+            return
+        self.dismiss(str(model))
 
 
 def _make_snippet(provider: str, model: str, peer_url: str, temp_key: str) -> str:
@@ -254,6 +550,20 @@ resp = requests.post(
     }},
 )
 print(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+'''
+    elif provider == "github-copilot":
+        return f'''\
+import requests
+
+resp = requests.post(
+    "{peer_url}/chat/completions",
+    headers={{"Authorization": "Bearer {temp_key}"}},
+    json={{
+        "model": "{model}",
+        "messages": [{{"role": "user", "content": "What is the capital of France?"}}],
+    }},
+)
+print(resp.json()["choices"][0]["message"]["content"])
 '''
     return "# Unknown provider"
 
@@ -466,10 +776,15 @@ class StatusScreen(Screen[None]):
             on_tokens_served=self.on_proxy_tokens_served,
         )
 
+        refresh_task: asyncio.Task[None] | None = None
+
         try:
             self.status_text = "Starting proxy and ngrok tunnel..."
             tunnel_url = await proxy.start("127.0.0.1", self.config.proxy_port)
             self.config.proxy_url = tunnel_url
+
+            if self.config.auth_method == "copilot":
+                refresh_task = asyncio.create_task(self._refresh_copilot_loop(proxy))
 
             self.status_text = "Connecting to server..."
             async with aiohttp.ClientSession() as session:
@@ -541,7 +856,25 @@ class StatusScreen(Screen[None]):
         except Exception as e:
             self.status_text = f"[red]Connection failed: {e}[/]"
         finally:
+            if refresh_task:
+                refresh_task.cancel()
             await proxy.stop()
+
+    async def _refresh_copilot_loop(self, proxy: object) -> None:
+        from client.proxy import ProxyServer
+
+        if not isinstance(proxy, ProxyServer):
+            return
+        while True:
+            await asyncio.sleep(25 * 60)
+            if not self.config.github_token:
+                break
+            try:
+                copilot = await refresh_copilot_token(self.config.github_token)
+                proxy._api_key = copilot.copilot_token
+                self.config.api_key = copilot.copilot_token
+            except Exception:
+                pass
 
 
 class TokenHubApp(App[None]):
@@ -553,20 +886,37 @@ class TokenHubApp(App[None]):
         super().__init__()
         self._provider: str = ""
         self._model: str = ""
+        self._api_key_prefill: str = ""
         self._tokens: int = 0
         self._want_provider: str = ""
         self._want_model: str = ""
         self._advanced: bool = False
         self._input_tokens: int = 0
         self._output_tokens: int = 0
+        self._auth_method: str = "api_key"
+        self._copilot_token: str = ""
+        self._github_token: str = ""
 
     def on_mount(self) -> None:
-        self.push_screen(ProviderScreen(), callback=self.on_provider_selected)
+        self.push_screen(AuthChoiceScreen(), callback=self.on_auth_choice)
 
-    def on_provider_selected(self, result: tuple[str, str] | None) -> None:
+    def on_auth_choice(self, choice: str | None) -> None:
+        if choice is None:
+            return
+        self._auth_method = choice
+        if choice == "copilot":
+            self.push_screen(
+                CopilotAuthScreen(), callback=self.on_copilot_authenticated
+            )
+        else:
+            self.push_screen(ProviderScreen(), callback=self.on_provider_selected)
+
+    # --- API Key path ---
+
+    def on_provider_selected(self, result: tuple[str, str, str] | None) -> None:
         if result is None:
             return
-        self._provider, self._model = result
+        self._provider, self._model, self._api_key_prefill = result
         self.push_screen(
             ExchangeScreen(self._provider, self._model),
             callback=self.on_exchange_configured,
@@ -585,11 +935,53 @@ class TokenHubApp(App[None]):
             self._input_tokens,
             self._output_tokens,
         ) = result
-        self.push_screen(KeyScreen(self._provider), callback=self.on_key_validated)
+        if self._auth_method == "copilot":
+            self._start_status(
+                api_key=self._copilot_token,
+                auth_method="copilot",
+                github_token=self._github_token,
+            )
+        else:
+            self.push_screen(
+                KeyScreen(self._provider, initial_key=self._api_key_prefill),
+                callback=self.on_key_validated,
+            )
 
     def on_key_validated(self, api_key: str | None) -> None:
         if api_key is None:
             return
+        self._start_status(api_key=api_key, auth_method="api_key")
+
+    # --- Copilot path ---
+
+    def on_copilot_authenticated(self, result: tuple[str, str] | None) -> None:
+        if result is None:
+            self.push_screen(AuthChoiceScreen(), callback=self.on_auth_choice)
+            return
+        self._copilot_token, self._github_token = result
+        self._provider = "github-copilot"
+        self.push_screen(
+            CopilotModelScreen(self._copilot_token),
+            callback=self.on_copilot_model_selected,
+        )
+
+    def on_copilot_model_selected(self, model: str | None) -> None:
+        if model is None:
+            return
+        self._model = model
+        self.push_screen(
+            ExchangeScreen(self._provider, self._model),
+            callback=self.on_exchange_configured,
+        )
+
+    # --- Shared ---
+
+    def _start_status(
+        self,
+        api_key: str,
+        auth_method: str = "api_key",
+        github_token: str = "",
+    ) -> None:
         config = ExchangeConfig(
             provider=self._provider,
             model=self._model,
@@ -601,6 +993,8 @@ class TokenHubApp(App[None]):
             want_provider=self._want_provider,
             want_model=self._want_model,
             api_key=api_key,
+            auth_method=auth_method,
+            github_token=github_token,
             input_tokens_offered=self._input_tokens if self._advanced else 0,
             output_tokens_offered=self._output_tokens if self._advanced else 0,
             advanced=self._advanced,

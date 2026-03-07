@@ -43,6 +43,10 @@ Input {
     margin: 1 0;
 }
 
+Button:focus {
+    text-style: bold;
+}
+
 .title {
     text-align: center;
     text-style: bold;
@@ -107,6 +111,24 @@ DataTable {
 }
 
 #copy-code-btn {
+    width: 100%;
+    margin: 1 0;
+}
+
+.copilot-device-code {
+    text-align: center;
+    text-style: bold;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+#auth-apikey-btn,
+#auth-copilot-btn {
+    width: 100%;
+    margin: 1 0;
+}
+
+#open-browser-btn {
     width: 100%;
     margin: 1 0;
 }
